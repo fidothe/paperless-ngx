@@ -2,6 +2,7 @@ import hashlib
 import itertools
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 from django.db.models import Q
@@ -160,11 +161,19 @@ def set_permissions(doc_ids, set_permissions, owner=None, merge=False):
 
 
 def rotate(doc_ids: list[int], degrees: int):
+    logger.info(
+        f"Attempting to rotate {len(doc_ids)} documents by {degrees} degrees.",
+    )
     qs = Document.objects.filter(id__in=doc_ids)
     affected_docs = []
     import pikepdf
 
     for doc in qs:
+        if not doc.has_archive_version:
+            logger.warning(
+                f"Document {doc.id} does not have an archive version, skipping rotation",
+            )
+            continue
         try:
             with pikepdf.open(doc.source_path, allow_overwriting_input=True) as pdf:
                 for page in pdf.pages:
@@ -175,10 +184,12 @@ def rotate(doc_ids: list[int], degrees: int):
                 update_document_archive_file.delay(
                     document_id=doc.id,
                 )
-                logger.info(f"Rotated document {doc.id} ({path}) by {degrees} degrees")
+                logger.info(
+                    f"Rotated document {doc.id} by {degrees} degrees",
+                )
                 affected_docs.append(doc.id)
         except Exception as e:
-            logger.exception(f"Error rotating document {doc.id}", e)
+            logger.exception(f"Error rotating document {doc.id}: {e}")
 
     if len(affected_docs) > 0:
         bulk_update_documents.delay(document_ids=affected_docs)
@@ -187,28 +198,32 @@ def rotate(doc_ids: list[int], degrees: int):
 
 
 def merge(doc_ids: list[int], metadata_document_id: Optional[int] = None):
+    logger.info(
+        f"Attempting to merge {len(doc_ids)} documents into a single document.",
+    )
     qs = Document.objects.filter(id__in=doc_ids)
+    affected_docs = []
     import pikepdf
 
     merged_pdf = pikepdf.new()
     # use doc_ids to preserve order
     for doc_id in doc_ids:
         doc = qs.get(id=doc_id)
-        if doc is None:
-            continue
-        path = os.path.join(settings.ORIGINALS_DIR, str(doc.filename))
         try:
-            with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+            with pikepdf.open(str(doc.source_path)) as pdf:
                 merged_pdf.pages.extend(pdf.pages)
+            affected_docs.append(doc.id)
         except Exception as e:
             logger.exception(
-                f"Error merging document {doc.id}, it will not be included in the merge",
-                e,
+                f"Error merging document {doc.id}, it will not be included in the merge: {e}",
             )
+    if len(affected_docs) == 0:
+        logger.warning("No documents were merged")
+        return "OK"
 
     filepath = os.path.join(
-        settings.CONSUMPTION_DIR,
-        f"merged_{('_'.join([str(doc_id) for doc_id in doc_ids]))[:100]}.pdf",
+        settings.SCRATCH_DIR,
+        f"{'_'.join([str(doc_id) for doc_id in doc_ids])[:100]}_merged.pdf",
     )
     merged_pdf.save(filepath)
 
@@ -239,16 +254,15 @@ def split(doc_ids: list[int], pages: list[list[int]]):
     doc = Document.objects.get(id=doc_ids[0])
     import pikepdf
 
-    path = os.path.join(settings.ORIGINALS_DIR, str(doc.filename))
     try:
-        with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        with pikepdf.open(doc.source_path) as pdf:
             for idx, split_doc in enumerate(pages):
                 dst = pikepdf.new()
                 for page in split_doc:
                     dst.pages.append(pdf.pages[page - 1])
                 filepath = os.path.join(
-                    settings.CONSUMPTION_DIR,
-                    f"{doc.filename}_{split_doc[0]}-{split_doc[-1]}.pdf",
+                    settings.SCRATCH_DIR,
+                    f"{Path(doc.filename).name}_{split_doc[0]}-{split_doc[-1]}.pdf",
                 )
 
                 dst.save(filepath)
@@ -266,6 +280,6 @@ def split(doc_ids: list[int], pages: list[list[int]]):
                     overrides,
                 )
     except Exception as e:
-        logger.exception(f"Error splitting document {doc.id}", e)
+        logger.exception(f"Error splitting document {doc.id}: {e}")
 
     return "OK"
